@@ -114,12 +114,16 @@ class Scheduler:
         self.accepted=self.drafted=0  #speculative acceptance stats
 
     def submit(self,req):
+        #request into job queue
         self.queue.append(req)
 
     def free_blocks(self):
         return len(self.pool.free_block_queue)
 
     def admit(self):
+        #If scheduler has free space then push request from queue to scheduler
+        #Initallize user for request and mtp buffers
+
         tpb=self.pool.tokens_per_block
         while self.queue and len(self.active)<self.max_batch:
             pages_needed=(len(self.queue[0].ids)+self.M+2)//tpb+1
@@ -142,7 +146,12 @@ class Scheduler:
         #rows: list of (req,pos,token[,hid]) with a request's rows contiguous & increasing.
         #allocates slots, builds the flat page table + per-row metadata, runs fn -> hiddens (n,D)
         dev=self.device
+
+        # get write_ptrs for eqch row for their positions
         write_ptrs=[r.user.slot(pos) for r,pos,*_ in rows]
+
+        #Build flat page table given requests contains table contiguous and starting points for each request
+        #page table is allocated pages for user
 
         page_table,page_starts=[],[]
         prev=None
@@ -153,9 +162,11 @@ class Scheduler:
                 prev=r
             page_starts.append(start)
 
+        #tokens and position for given rows
         positions=[pos for _,pos,*_ in rows]
         tokens=torch.tensor([t for _,_,t,*_ in rows],device=dev).long()
 
+        #Runs fn with these arguments
         h=fn(tokens,self.pool,
              torch.tensor(page_table,dtype=torch.int32,device=dev),
              torch.tensor(page_starts,dtype=torch.int32,device=dev),
@@ -186,18 +197,108 @@ class Scheduler:
 
         #cache-full: preempt newest until this iteration's high-water pages fit
         while True:
+            #find how many pages needed. Done via subtracting pages to fit tokens - pages already acquired
             need=sum(max(0,(len(r.ids)+M+tpb-1)//tpb-len(r.user.block_ids)) for r in self.active)
             if need<=self.free_blocks():
                 break
             if len(self.active)==1:
                 raise RuntimeError("kv pool too small for a single request")
             self.preempt()
+
         A=self.active
         if not A:
             return
 
-        #---- trunk: feed every unfed committed token (whole prompt on admission = batched prefill,
-        #---- one row at steady state). sample the next token from each request's tip row
+        #route: fresh/replayed requests (whole sequence unfed, cache empty) take the intradoc
+        #prefill path; steady-state requests (one unfed token) take the speculative decode path
+        pre=[r for r in A if len(r.ids)-r.fed>1]
+        dec=[r for r in A if len(r.ids)-r.fed==1]
+        if pre:
+            self.prefill_step(pre)
+        if dec:
+            self.spec_step(dec)
+
+        #evict finished, free their pages
+        for r in A:
+            if r.done:
+                r.user.free_cache()
+                r.user=None
+                self.finished.append(r)
+        self.active=[r for r in A if not r.done]
+
+    def prefill_launch(self,rows,fn):
+        #like launch() but for the intradoc kernel: cuseq is cumulative TOKEN counts, no page
+        #table needed (attention runs on the dense k,v computed in-pass; kv still written to pages)
+        dev=self.device
+        write_ptrs=[r.user.slot(pos) for r,pos,*_ in rows]
+
+        counts=[]
+        prev=None
+        for r,_,_ in rows:
+            if r is not prev:
+                counts.append(0)
+                prev=r
+            counts[-1]+=1
+        cuseq=[0]
+        for c in counts:
+            cuseq.append(cuseq[-1]+c)
+
+        h=fn(torch.tensor([t for _,_,t in rows],device=dev).long(),self.pool,
+             torch.tensor([p for _,p,_ in rows],device=dev).long(),
+             torch.tensor(write_ptrs,device=dev).long(),
+             torch.tensor(cuseq,dtype=torch.int32,device=dev),
+             max(counts))
+        return h
+
+    def prefill_step(self,pre):
+        #batched prefill through the intradoc kernel: trunk + mtp head caches in one iteration,
+        #sample the first token from each tip, speculation starts next iteration. exactness needs
+        #an empty cache per request (positions restart at 0), true for fresh and replayed requests
+        M=self.M
+        P={r:len(r.ids) for r in pre}
+        assert all(r.fed==0 for r in pre)
+
+        rows=[(r,p,r.ids[p]) for r in pre for p in range(P[r])]
+        h=self.prefill_launch(rows,self.model.prefill_rows)
+
+        #head i covers positions [0, P-2-i] (embed of token t+1+i must lie inside the prompt);
+        #its frontier lands at P-1-i and the next spec iteration's catch-up takes it from there.
+        #stash[i] keeps the previous stage's hiddens the head has not consumed yet
+        prev_h,prev_cnt=h,[P[r] for r in pre]
+        for i in range(M):
+            rows,hids=[],[]
+            off=0
+            for ri,r in enumerate(pre):
+                n=max(0,P[r]-1-i)
+                rows+=[(r,p,r.ids[p+1+i]) for p in range(n)]
+                hids.append(prev_h[off:off+n])
+
+                r.head_fed[i]=max(0,P[r]-1-i)
+                r.stash[i]=HidBuf()
+                r.stash[i].start=r.head_fed[i]
+                r.stash[i].push(prev_h[off+r.head_fed[i]:off+prev_cnt[ri]])
+                off+=prev_cnt[ri]
+
+            if rows:
+                h_in=torch.cat(hids)
+                prev_h=self.prefill_launch(rows,lambda t,*a:self.model.mtp_prefill_rows(i,h_in,t,*a))
+            else:
+                prev_h=prev_h[:0]
+            prev_cnt=[max(0,P[r]-1-i) for r in pre]
+
+        #sample the first new token from each request's tip row
+        off=0
+        for r in pre:
+            prob=r.sample_prob(self.model.logits(h[off+P[r]-1]),r.ids)
+            r.ids.append(int(torch.multinomial(prob,1)))
+            r.fed=P[r]
+            off+=P[r]
+            self.finish_check(r)
+
+    def spec_step(self,A):
+        M=self.M
+
+        #---- trunk: feed the unfed tip token, sample the next from each request's tip row
         rows=[(r,p,r.ids[p]) for r in A for p in range(r.fed,len(r.ids))]
         h=self.launch(rows,self.model.trunk_rows)
 
@@ -281,13 +382,6 @@ class Scheduler:
                         r.head_fed[i]=p
                         if i+1<M:
                             r.stash[i+1].truncate(p)
-
-        for r in A:
-            if r.done:
-                r.user.free_cache()
-                r.user=None
-                self.finished.append(r)
-        self.active=[r for r in A if not r.done]
 
     def run(self):
         while self.queue or self.active:

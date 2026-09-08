@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from paged_attention_kernels import paged_flash_decode
+from intradocatt_fwd_kernels import triton_intradoc_attention
 from block_table import write_kv_cache_decode
 
 #NOTE: module registration order below must match the training model (LLM_train/model.py)
@@ -113,6 +114,27 @@ class paged_gqa(nn.Module):
         out=paged_flash_decode(q,page_table,pool,kv_lens,self.group_size,page_starts,max_seq_len,layer)
         return residual+self.linear_proj(out.view(B,D))
 
+    def prefill(self,x,cos,sin,pool,positions,write_ptrs,cuseq,max_len,layer):
+        #x (T,D): concatenated request prompts, cuseq = cumulative TOKEN counts. valid only when
+        #each request starts from an empty cache (positions restart at 0 per request), so the
+        #dense k,v computed here IS the whole context and intradoc attention is exact
+        B,D=x.shape
+        residual=x
+        x=self.rms_norm_att(x)
+
+        q=self.q_proj(x).view(B,self.n_heads,self.head_dim)
+        kv=self.kv_proj(x).view(B,2,self.kvn_heads,self.head_dim)
+        k,v=kv.unbind(1)
+
+        q,k=apply_rope_decode(q,k,cos,sin,positions)
+        q,k,v=q.contiguous(),k.contiguous(),v.contiguous()
+
+        write_kv_cache_decode[(self.kvn_heads,B)](pool.block[layer],write_ptrs,k,v,
+                                                  pool.kv_stride,pool.head_stride,HEAD_DIM=self.head_dim)
+
+        out,_=triton_intradoc_attention(q,k,v,cuseq,max_len,self.group_size)
+        return residual+self.linear_proj(out.view(B,D))
+
 
 class Transformer_block(nn.Module):
     def __init__(self,d_model,n_heads,num_layers,ffn_hidden_dim,group_size):
@@ -123,6 +145,10 @@ class Transformer_block(nn.Module):
 
     def decode(self,x,cos,sin,pool,page_table,page_starts,positions,kv_lens,write_ptrs,max_seq_len,layer):
         x=self.att.decode(x,cos,sin,pool,page_table,page_starts,positions,kv_lens,write_ptrs,max_seq_len,layer)
+        return x+self.ffn(self.rms_norm_ffn(x))
+
+    def prefill(self,x,cos,sin,pool,positions,write_ptrs,cuseq,max_len,layer):
+        x=self.att.prefill(x,cos,sin,pool,positions,write_ptrs,cuseq,max_len,layer)
         return x+self.ffn(self.rms_norm_ffn(x))
 
 
@@ -137,6 +163,11 @@ class mtp_head(nn.Module):
     def decode(self,h,embed,cos,sin,pool,page_table,page_starts,positions,kv_lens,write_ptrs,max_seq_len,layer):
         x=self.proj(torch.cat([h,self.rms_embed(embed)],dim=-1))
         x=self.trans_block.decode(x,cos,sin,pool,page_table,page_starts,positions,kv_lens,write_ptrs,max_seq_len,layer)
+        return self.rms_out(x)
+
+    def prefill(self,h,embed,cos,sin,pool,positions,write_ptrs,cuseq,max_len,layer):
+        x=self.proj(torch.cat([h,self.rms_embed(embed)],dim=-1))
+        x=self.trans_block.prefill(x,cos,sin,pool,positions,write_ptrs,cuseq,max_len,layer)
         return self.rms_out(x)
 
 
@@ -176,6 +207,20 @@ class Transformer(nn.Module):
         embed=self.embedding(tokens)
         return self.mtp_heads_list[i].decode(h,embed,self.cos,self.sin,pool,page_table,page_starts,
                                              positions,kv_lens,write_ptrs,max_seq_len,self.num_layers+i)
+
+    @torch.no_grad()
+    def prefill_rows(self,tokens,pool,positions,write_ptrs,cuseq,max_len):
+        #tokens (T,) concatenated prompts -> rms_out hidden (T,D). intradoc attention per layer
+        x=self.embedding(tokens)
+        for i,blk in enumerate(self.transformer_block_list):
+            x=blk.prefill(x,self.cos,self.sin,pool,positions,write_ptrs,cuseq,max_len,i)
+        return self.rms_out(x)
+
+    @torch.no_grad()
+    def mtp_prefill_rows(self,i,h,tokens,pool,positions,write_ptrs,cuseq,max_len):
+        embed=self.embedding(tokens)
+        return self.mtp_heads_list[i].prefill(h,embed,self.cos,self.sin,pool,positions,
+                                              write_ptrs,cuseq,max_len,self.num_layers+i)
 
     def logits(self,h):
         return h@self.embedding.weight.T
