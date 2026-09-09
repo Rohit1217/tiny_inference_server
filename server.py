@@ -155,6 +155,9 @@ class Scheduler:
 
         page_table,page_starts=[],[]
         prev=None
+
+        #Get the page_starts arr for each requests. Assume request contiguous of form r1,r1,r1,r2,r2..=[0,0,0,3,3]
+        #Can get cuseq easily from here for intradoc and page atten. 
         for r,pos,*_ in rows:
             if r is not prev:
                 start=len(page_table)
@@ -166,6 +169,7 @@ class Scheduler:
         positions=[pos for _,pos,*_ in rows]
         tokens=torch.tensor([t for _,_,t,*_ in rows],device=dev).long()
 
+        #give page_table,starts for paged atten, write_ptrs for kv cache writing and positions for rope
         #Runs fn with these arguments
         h=fn(tokens,self.pool,
              torch.tensor(page_table,dtype=torch.int32,device=dev),
@@ -209,10 +213,11 @@ class Scheduler:
         if not A:
             return
 
-        #route: fresh/replayed requests (whole sequence unfed, cache empty) take the intradoc
-        #prefill path; steady-state requests (one unfed token) take the speculative decode path
-        pre=[r for r in A if len(r.ids)-r.fed>1]
-        dec=[r for r in A if len(r.ids)-r.fed==1]
+        #route: fresh/replayed requests (cache empty) take the intradoc prefill path — even a
+        #1-token prompt, since spec_step needs the tip hidden prefill stashes; steady-state
+        #requests (one unfed token, hidden stashed) take the speculative decode path
+        pre=[r for r in A if r.fed==0]
+        dec=[r for r in A if r.fed>0]
         if pre:
             self.prefill_step(pre)
         if dec:
@@ -230,18 +235,20 @@ class Scheduler:
         #like launch() but for the intradoc kernel: cuseq is cumulative TOKEN counts, no page
         #table needed (attention runs on the dense k,v computed in-pass; kv still written to pages)
         dev=self.device
+        #kv write ptrs
         write_ptrs=[r.user.slot(pos) for r,pos,*_ in rows]
 
         counts=[]
         prev=None
         for r,_,_ in rows:
+            #cuseq calculation by finding counts in each req
             if r is not prev:
                 counts.append(0)
                 prev=r
             counts[-1]+=1
         cuseq=[0]
         for c in counts:
-            cuseq.append(cuseq[-1]+c)
+            cuseq.append(cuseq[-1]+c) #pref+curr_count
 
         h=fn(torch.tensor([t for _,_,t in rows],device=dev).long(),self.pool,
              torch.tensor([p for _,p,_ in rows],device=dev).long(),
@@ -258,6 +265,7 @@ class Scheduler:
         P={r:len(r.ids) for r in pre}
         assert all(r.fed==0 for r in pre)
 
+        #prefill trunk
         rows=[(r,p,r.ids[p]) for r in pre for p in range(P[r])]
         h=self.prefill_launch(rows,self.model.prefill_rows)
 
@@ -269,14 +277,17 @@ class Scheduler:
             rows,hids=[],[]
             off=0
             for ri,r in enumerate(pre):
-                n=max(0,P[r]-1-i)
-                rows+=[(r,p,r.ids[p+1+i]) for p in range(n)]
+                n=max(0,P[r]-1-i) #valid accepted tokens for given mtp head
+                rows+=[(r,p,r.ids[p+1+i]) for p in range(n)] #create request position, ith head predicts takes p+i+1 embedding
                 hids.append(prev_h[off:off+n])
 
+                #Track which position verified and which are not 
                 r.head_fed[i]=max(0,P[r]-1-i)
                 r.stash[i]=HidBuf()
                 r.stash[i].start=r.head_fed[i]
                 r.stash[i].push(prev_h[off+r.head_fed[i]:off+prev_cnt[ri]])
+
+                #move to next request ,prev cnt says where next request starts
                 off+=prev_cnt[ri]
 
             if rows:
@@ -296,92 +307,84 @@ class Scheduler:
             self.finish_check(r)
 
     def spec_step(self,A):
+        #fused iteration, ONE trunk pass: heads draft first — the tip hidden is already stashed
+        #(from prefill or the previous verify) and the embed is the pending token ids[-1] — then
+        #the trunk pass feeds [pending, d1..dM]: row k verifies d_{k+1} and on full accept the
+        #last row's dist samples the next token for free (bonus). with M=0 this degenerates to
+        #the plain decode step (1 row, bonus = the sampled token)
         M=self.M
-
-        #---- trunk: feed the unfed tip token, sample the next from each request's tip row
-        rows=[(r,p,r.ids[p]) for r in A for p in range(r.fed,len(r.ids))]
-        h=self.launch(rows,self.model.trunk_rows)
-
-        tip={}
-        off=0
-        for r in A:
-            n=len(r.ids)-r.fed
-            if M>0:
-                r.stash[0].push(h[off:off+n])
-            tip[r]=len(r.ids)-1
-            prob=r.sample_prob(self.model.logits(h[off+n-1]),r.ids)
-            r.ids.append(int(torch.multinomial(prob,1)))
-            r.fed=len(r.ids)-1
-            off+=n
-            self.finish_check(r)
-
-        live=[r for r in A if not r.done]
-        snap={r:list(r.ids) for r in live}  #penalty ctx frozen here so draft & verify dists match
+        snap={r:list(r.ids) for r in A}  #penalty ctx frozen here so draft & verify dists match
+        tip={r:len(r.ids)-2 for r in A}  #draft position: hidden stashed, embed is pending ids[-1]
 
         #---- mtp draft: head i processes [head_fed[i] .. tip] (catch-up fills the cache holes
         #---- left by multi-token commits, tip row drafts). embed input at pos p is token p+1+i
-        draft={r:[] for r in live}
-        draft_prob={r:[] for r in live}
-        if M>0 and live:
-            for i in range(M):
-                rows,hids=[],[]
-                for r in live:
-                    for p in range(r.head_fed[i],tip[r]+1):
-                        idx=p+1+i
-                        tok=r.ids[idx] if idx<len(r.ids) else draft[r][idx-len(r.ids)]
-                        rows.append((r,p,tok))
-                    hids.append(r.stash[i].take(r.head_fed[i],tip[r]))
-                h_in=torch.cat(hids)
+        draft={r:[] for r in A}
+        draft_prob={r:[] for r in A}
+        for i in range(M):
+            rows,hids=[],[]
+            for r in A:
+                for p in range(r.head_fed[i],tip[r]+1):
+                    idx=p+1+i
+                    tok=r.ids[idx] if idx<len(r.ids) else draft[r][idx-len(r.ids)]
+                    rows.append((r,p,tok))
+                hids.append(r.stash[i].take(r.head_fed[i],tip[r]))
+            h_in=torch.cat(hids)
 
-                h=self.launch(rows,lambda t,*a:self.model.mtp_rows(i,h_in,t,*a))
+            h=self.launch(rows,lambda t,*a:self.model.mtp_rows(i,h_in,t,*a))
 
-                off=0
-                for r in live:
-                    n=tip[r]+1-r.head_fed[i]
-                    if i+1<M:
-                        r.stash[i+1].push(h[off:off+n])
-                    prob=r.sample_prob(self.model.logits(h[off+n-1]),snap[r])
-                    draft[r].append(int(torch.multinomial(prob,1)))
-                    draft_prob[r].append(prob)
-                    r.head_fed[i]=tip[r]+1
-                    off+=n
+            off=0
+            for r in A:
+                n=tip[r]+1-r.head_fed[i]
+                if i+1<M:
+                    r.stash[i+1].push(h[off:off+n])
+                prob=r.sample_prob(self.model.logits(h[off+n-1]),snap[r])
+                draft[r].append(int(torch.multinomial(prob,1)))
+                draft_prob[r].append(prob)
+                r.head_fed[i]=tip[r]+1
+                off+=n
 
-            #---- verify: one trunk pass over [main, d1..d_{M-1}] checks d1..dM in parallel
-            rows=[]
-            for r in live:
-                chain=[r.ids[tip[r]+1]]+draft[r][:M-1]
-                rows+=[(r,tip[r]+1+k,chain[k]) for k in range(M)]
-            h=self.launch(rows,self.model.trunk_rows)
+        #---- single trunk pass over [pending, d1..dM]: verify + bonus in one launch
+        rows=[]
+        for r in A:
+            chain=[r.ids[-1]]+draft[r]
+            rows+=[(r,tip[r]+1+k,chain[k]) for k in range(M+1)]
+        h=self.launch(rows,self.model.trunk_rows)
 
-            for bi,r in enumerate(live):
-                hv=h[bi*M:(bi+1)*M]
-                p=tip[r]
-                j=M+1  #first rejected draft (1-based), M+1 = all accepted
-                for k in range(M):
-                    q=r.sample_prob(self.model.logits(hv[k]),snap[r])
-                    d=draft_prob[r][k]
-                    tok=draft[r][k]
-                    if not r.done and torch.rand(1).item()<(q[tok]/(d[tok]+1e-10)).item():
-                        r.ids.append(tok)  #accept
+        for bi,r in enumerate(A):
+            hv=h[bi*(M+1):(bi+1)*(M+1)]
+            p=tip[r]
+            j=M+1  #first rejected draft (1-based), M+1 = all accepted
+            for k in range(M):
+                q=r.sample_prob(self.model.logits(hv[k]),snap[r])
+                d=draft_prob[r][k]
+                tok=draft[r][k]
+                if not r.done and torch.rand(1).item()<(q[tok]/(d[tok]+1e-10)).item():
+                    r.ids.append(tok)  #accept
+                    self.finish_check(r)
+                else:
+                    j=k+1
+                    if not r.done:  #reject: resample from the residual
+                        res=torch.clamp(q-d,min=0)+1e-12
+                        r.ids.append(int(torch.multinomial(res/res.sum(),1)))
                         self.finish_check(r)
-                    else:
-                        j=k+1
-                        if not r.done:  #reject: resample from the residual
-                            res=torch.clamp(q-d,min=0)+1e-12
-                            r.ids.append(int(torch.multinomial(res/res.sum(),1)))
-                            self.finish_check(r)
-                        break
-                self.accepted+=min(j-1,M); self.drafted+=M
+                    break
+            self.accepted+=min(j-1,M); self.drafted+=M
 
-                #stale kv of rejected drafts: verify wrote positions p+1..p+M, valid through p+j.
-                #position-addressed slots mean rollback is just rewinding fed lengths
-                r.fed=p+min(j,M)+1
-                r.stash[0].push(hv[:r.fed-(p+1)])
-                for i in range(1,M):
-                    if i>=j:  #head i's tip entry used draft d_i, which was rejected
-                        r.head_fed[i]=p
-                        if i+1<M:
-                            r.stash[i+1].truncate(p)
+            if j==M+1 and not r.done:  #all accepted: bonus token from the last row's dist
+                prob=r.sample_prob(self.model.logits(hv[M]),r.ids)
+                r.ids.append(int(torch.multinomial(prob,1)))
+                self.finish_check(r)
+
+            #stale kv of rejected drafts: the pass wrote positions p+1..p+M+1, valid through p+j.
+            #position-addressed slots mean rollback is just rewinding fed lengths
+            r.fed=p+1+j
+            if M>0:
+                r.stash[0].push(hv[:j])
+            for i in range(1,M):
+                if i>=j:  #head i's tip entry used draft d_i, which was rejected
+                    r.head_fed[i]=p
+                    if i+1<M:
+                        r.stash[i+1].truncate(p)
 
     def run(self):
         while self.queue or self.active:
