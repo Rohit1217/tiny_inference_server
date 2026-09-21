@@ -96,21 +96,27 @@ Throughput vs batch size:
 
 | batch | plain tok/s | spec tok/s | spec tok/iter | ms/iter (plain / spec) | roofline % |
 |---|---|---|---|---|---|
-| 1 | 30.6 | 50.9 | 2.03 | 32.7 / 39.7 | 6.5 / 5.8 |
-| 2 | 57.6 | 87.9 | 1.97 | 33.4 / 42.7 | 6.4 / 5.4 |
-| 4 | 112.8 | 143.6 | 1.96 | 35.5 / 50.5 | 6.0 / 4.5 |
-| 8 | 201.2 | 212.8 | 1.96 | 39.8 / 65.0 | 5.4 / 3.6 |
-| 16 | 324.5 | 306.6 | 2.02 | 47.6 / 97.6 | 4.6 / 2.4 |
+| 1 | 29.0 | 49.9 | 1.98 | 34.6 / 39.4 | 6.2 / 5.8 |
+| 4 | 120.9 | 185.8 | 1.97 | 32.5 / 39.1 | 6.6 / 5.9 |
+| 16 | 483.1 | 673.7 | 1.99 | 33.1 / 41.1 | 6.6 / 5.7 |
+| 32 | 848.9 | 1226.0 | 1.98 | 37.3 / 43.7 | 6.0 / 5.5 |
+| 64 | 1863.8 | 2082.5 | 2.01 | 34.1 / 49.1 | 6.9 / 5.0 |
 
 Roofline is the fraction of the memory-bandwidth floor: decode has to read
 the 1.75 GB of weights once per iteration, which is 2.3 ms at 768 GB/s. We
-are at 3-6% of that. Fitting the table, an iteration costs about
-`32 ms + 1 ms/request` for plain decode and `35 ms + 3.9 ms/request` with
-speculation. The fixed 32 ms is kernel launches and Python; the per-request
-part is the sampling loop (top-k/top-p and the accept test run once per row
-in Python, with a GPU sync each). Speculation does ~4x more of those per
-request, which is why it wins at batch 1 (1.66x) and loses at batch 16
-(0.94x) even though it commits ~2 tokens per iteration throughout.
+are at 5-7% of that, and an iteration takes the same ~33 ms (plain) or
+~40 ms (spec) whether the batch is 1 or 64. That fixed cost is kernel
+launches and Python, roughly 1000 launches per iteration. Throughput
+scales almost linearly with batch because extra rows are nearly free, so
+per-token latency does not get worse as the batch grows.
+
+The first version of this sampled each row separately in Python (its own
+logits matvec reading the whole 147 MB embedding matrix, its own top-k /
+top-p, and a GPU sync for every accept test). That cost ~1 ms per request
+per iteration for plain decode and ~3.9 ms with speculation, enough that
+speculation actually lost to plain decode at batch 16 (307 vs 325 tok/s).
+Batching the logits, the sort and the accept test across all rows in an
+iteration removed it: batch 16 went from 307 to 674 tok/s with speculation.
 
 Speculative decoding stats (batch 8):
 
@@ -154,25 +160,29 @@ Memory: the 4 GB page pool is <1% used by these workloads. With the
 starved down to 40 pages hits 100% utilisation, preempts 10 times and still
 produces the same outputs.
 
-Correctness is checked by greedy equivalence: with `top_k=1` speculative
-decoding must produce exactly the same tokens as plain decoding, including
-under preemption. Batched prefill is checked against a dense attention
-reference at every position.
+Correctness (`test_server.py`): with `top_k=1` speculative decoding must
+produce exactly the same tokens as plain decoding, including under forced
+preemption; batched prefill and a decode step over prefill-written pages
+are checked against a dense attention reference at every position; and
+because greedy cannot see the residual-resampling path, 4096 sampled
+3-token continuations are compared as histograms, speculative vs plain,
+against a plain-vs-plain baseline.
 
 ## Status
 
 Works end to end, but slow in absolute terms because it is overhead-bound.
 In order of expected payoff:
 
-1. Batch the sampling. One top-k/top-p/multinomial over all rows in an
-   iteration instead of a Python loop with a sync per row. This is what makes
-   speculation lose at large batch.
-2. CUDA graphs for the decode iteration, to get rid of the fixed ~32 ms.
-3. Run prefill for new arrivals in its own iteration so it does not stall
+1. CUDA graphs for the decode iteration, to get rid of the fixed ~32 ms.
+   Everything else is now small next to it.
+2. Run prefill for new arrivals in its own iteration so it does not stall
    in-flight decodes.
-4. The head-cache rollback is written for 2 MTP heads. With 3 or more, a
+3. The head-cache rollback is written for 2 MTP heads. With 3 or more, a
    rejected draft can invalidate more than the tip entry; the fix is known
    but not done.
+
+Done: batched sampling (was the per-request cost that made speculation lose
+at large batch).
 
 ## Layout
 
@@ -186,5 +196,6 @@ intradocatt_fwd_kernels.py    triton intra-doc attention, used for prefill
 server.py                     scheduler: admit / prefill / spec decode / preempt
 serve.py                      aiohttp server with streaming
 evals.py                      perf + load evals
+test_server.py                correctness tests (tiny random model)
 test_gqa_paged.py             kernel test
 ```
