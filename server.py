@@ -19,33 +19,39 @@ MAX_BATCH=8
 DEVICE="cuda:0"
 
 
+def batch_probs(logits,temps,top_ks,top_ps,pens,ctxs):
+    #(n,V) logits -> (n,V) probs, every row at once. penalty -> temperature -> top_k -> top_p -> softmax
+    #one sort does both top_k (rank mask) and top_p (cumsum mask) instead of topk+sort per row.
+    #no host syncs in here, caller does one .tolist() after multinomial
+    n,V=logits.shape; dev=logits.device
+    logits=logits.float()
+
+    if any(pn!=1.0 for pn in pens):
+        #penalty mask built from the ctx token ids, rows with pen 1 get no entries
+        rows=[i for i in range(n) if pens[i]!=1.0 for _ in set(ctxs[i])]
+        cols=[t for i in range(n) if pens[i]!=1.0 for t in set(ctxs[i])]
+        mask=torch.zeros(n,V,dtype=torch.bool,device=dev)
+        mask[torch.tensor(rows,dtype=torch.long,device=dev),torch.tensor(cols,dtype=torch.long,device=dev)]=True
+        pen=torch.tensor(pens,device=dev)[:,None]
+        logits=torch.where(mask,torch.where(logits>0,logits/pen,logits*pen),logits)
+
+    logits=logits/torch.tensor(temps,device=dev)[:,None]
+
+    srt,idx=torch.sort(logits,dim=-1,descending=True)
+    k=torch.tensor([kk if kk>0 else V for kk in top_ks],device=dev)[:,None]  #0 = off
+    srt=srt.masked_fill(torch.arange(V,device=dev)[None,:]>=k,float("-inf"))
+
+    pp=torch.tensor([x if x>0 else 2.0 for x in top_ps],device=dev)[:,None]  #0 = off, cum never > 2
+    remove=torch.cumsum(F.softmax(srt,dim=-1),dim=-1)>pp
+    remove[:,1:]=remove[:,:-1].clone()
+    remove[:,0]=False
+    srt=srt.masked_fill(remove,float("-inf"))
+
+    return F.softmax(torch.full_like(logits,float("-inf")).scatter_(1,idx,srt),dim=-1)
+
 def process_logits(logits,temperature,top_k=0,top_p=0,rep_penalty=1.0,ctx=None):
-    #penalty -> temperature -> top_k -> top_p -> softmax. draft and verifier dists go through
-    #this identically (same ctx snapshot) so the acceptance ratio compares matching dists
-    logits=logits.float().clone()
-    vocab=logits.shape[-1]
-
-    if rep_penalty!=1.0 and ctx:
-        idx=torch.tensor(list(set(ctx)),device=logits.device)
-        sel=logits[idx]
-        logits[idx]=torch.where(sel>0,sel/rep_penalty,sel*rep_penalty)
-
-    logits=logits/temperature
-
-    if top_k>0:
-        k=torch.topk(-logits,vocab-top_k)
-        logits[k[1]]=float("-inf")
-
-    if top_p>0:
-        sorted_logits,sorted_idx=torch.sort(logits,descending=True)
-        cum_prob=torch.cumsum(F.softmax(sorted_logits,dim=-1),dim=-1)
-        remove=cum_prob>top_p
-        remove[1:]=remove[:-1].clone()
-        remove[0]=False
-        sorted_logits[remove]=float("-inf")
-        logits=torch.full_like(logits,float("-inf")).scatter_(0,sorted_idx,sorted_logits)
-
-    return F.softmax(logits,dim=-1)
+    #single row, kept for tests
+    return batch_probs(logits[None],[temperature],[top_k],[top_p],[rep_penalty],[ctx or []])[0]
 
 
 class HidBuf:
@@ -90,9 +96,6 @@ class Request:
 
     def out_ids(self):
         return self.ids[self.prompt_len:]
-
-    def sample_prob(self,logits,ctx):
-        return process_logits(logits,self.temperature,self.top_k,self.top_p,self.rep_penalty,ctx)
 
 
 class Scheduler:
@@ -184,6 +187,12 @@ class Scheduler:
              torch.tensor(write_ptrs,device=dev).long(),
              max(positions)+1)
         return h
+
+    def sample(self,logits,reqs,ctxs):
+        #(n,V) logits for n tip rows -> probs (n,V) and sampled tokens. one multinomial, one sync
+        probs=batch_probs(logits,[r.temperature for r in reqs],[r.top_k for r in reqs],
+                          [r.top_p for r in reqs],[r.rep_penalty for r in reqs],ctxs)
+        return probs,torch.multinomial(probs,1).squeeze(1).tolist()
 
     def finish_check(self,r):
         #truncate at EOS / caps, mark done
@@ -303,13 +312,14 @@ class Scheduler:
                 prev_h=prev_h[:0]
             prev_cnt=[max(0,P[r]-1-i) for r in pre]
 
-        #sample the first new token from each request's tip row
-        off=0
+        #sample the first new token from each request's tip row, all requests in one shot
+        tips,off=[],0
         for r in pre:
-            prob=r.sample_prob(self.model.logits(h[off+P[r]-1]),r.ids)
-            r.ids.append(int(torch.multinomial(prob,1)))
+            tips.append(off+P[r]-1); off+=P[r]
+        _,toks=self.sample(self.model.logits(h[tips]),pre,[r.ids for r in pre])
+        for r,t in zip(pre,toks):
+            r.ids.append(t)
             r.fed=P[r]
-            off+=P[r]
             self.finish_check(r)
 
     def spec_step(self,A):
@@ -324,28 +334,31 @@ class Scheduler:
 
         #---- mtp draft: head i processes [head_fed[i] .. tip] (catch-up fills the cache holes
         #---- left by multi-token commits, tip row drafts). embed input at pos p is token p+1+i
+        B=len(A)
         draft={r:[] for r in A}
-        draft_prob={r:[] for r in A}
+        draft_prob=[]  #per head: (B,V) dists the drafts were sampled from
         for i in range(M):
-            rows,hids=[],[]
+            rows,hids,tips=[],[],[]
             for r in A:
                 for p in range(r.head_fed[i],tip[r]+1):
                     idx=p+1+i
                     tok=r.ids[idx] if idx<len(r.ids) else draft[r][idx-len(r.ids)]
                     rows.append((r,p,tok))
                 hids.append(r.stash[i].take(r.head_fed[i],tip[r]))
+                tips.append(len(rows)-1)  #this request's tip row, the only one we sample from
             h_in=torch.cat(hids)
 
             h=self.launch(rows,lambda t,*a:self.model.mtp_rows(i,h_in,t,*a))
 
+            #logits for the B tip rows in one matmul, one sample over all of them
+            probs,toks=self.sample(self.model.logits(h[tips]),A,[snap[r] for r in A])
+            draft_prob.append(probs)
             off=0
-            for r in A:
+            for bi,r in enumerate(A):
                 n=tip[r]+1-r.head_fed[i]
                 if i+1<M:
                     r.stash[i+1].push(h[off:off+n])
-                prob=r.sample_prob(self.model.logits(h[off+n-1]),snap[r])
-                draft[r].append(int(torch.multinomial(prob,1)))
-                draft_prob[r].append(prob)
+                draft[r].append(toks[bi])
                 r.head_fed[i]=tip[r]+1
                 off+=n
 
@@ -356,39 +369,57 @@ class Scheduler:
             rows+=[(r,tip[r]+1+k,chain[k]) for k in range(M+1)]
         h=self.launch(rows,self.model.trunk_rows)
         self.trunk_passes+=1
+        logits=self.model.logits(h)  #(B*(M+1),V), embedding matrix read once for every row
+        dev=logits.device
 
+        #accept test for every (request, draft) on gpu, one sync brings back the decisions.
+        #residual resamples are drawn for all of them too, only the first reject per row is used
+        if M>0:
+            vidx=[bi*(M+1)+k for bi in range(B) for k in range(M)]
+            q=batch_probs(logits[vidx],[r.temperature for r in A for _ in range(M)],[r.top_k for r in A for _ in range(M)],
+                          [r.top_p for r in A for _ in range(M)],[r.rep_penalty for r in A for _ in range(M)],
+                          [snap[r] for r in A for _ in range(M)]).view(B,M,-1)
+            d=torch.stack(draft_prob,1)  #(B,M,V)
+            toks=torch.tensor([draft[r] for r in A],device=dev)
+            qv=q.gather(2,toks[...,None]).squeeze(2)
+            dv=d.gather(2,toks[...,None]).squeeze(2)
+            acc=(torch.rand(B,M,device=dev)<qv/(dv+1e-10)).tolist()
+            res=torch.clamp(q-d,min=0)+1e-12
+            res_tok=torch.multinomial((res/res.sum(-1,keepdim=True)).view(B*M,-1),1).view(B,M).tolist()
+
+        J=[]
         for bi,r in enumerate(A):
-            hv=h[bi*(M+1):(bi+1)*(M+1)]
-            p=tip[r]
             j=M+1  #first rejected draft (1-based), M+1 = all accepted
             for k in range(M):
-                q=r.sample_prob(self.model.logits(hv[k]),snap[r])
-                d=draft_prob[r][k]
-                tok=draft[r][k]
                 self.head_try[k]+=1
-                if not r.done and torch.rand(1).item()<(q[tok]/(d[tok]+1e-10)).item():
-                    r.ids.append(tok)  #accept
+                if not r.done and acc[bi][k]:
+                    r.ids.append(draft[r][k])  #accept
                     self.head_acc[k]+=1
                     self.finish_check(r)
                 else:
                     j=k+1
-                    if not r.done:  #reject: resample from the residual
-                        res=torch.clamp(q-d,min=0)+1e-12
-                        r.ids.append(int(torch.multinomial(res/res.sum(),1)))
+                    if not r.done:  #reject: token from the residual dist
+                        r.ids.append(res_tok[bi][k])
                         self.finish_check(r)
                     break
             self.accepted+=min(j-1,M); self.drafted+=M
+            J.append(j)
 
-            if j==M+1 and not r.done:  #all accepted: bonus token from the last row's dist
-                prob=r.sample_prob(self.model.logits(hv[M]),r.ids)
-                r.ids.append(int(torch.multinomial(prob,1)))
-                self.finish_check(r)
+        #all accepted: bonus token from the last row's dist. with M=0 every row is a bonus row
+        bon=[bi for bi,r in enumerate(A) if J[bi]==M+1 and not r.done]
+        if bon:
+            _,toks=self.sample(logits[[bi*(M+1)+M for bi in bon]],[A[bi] for bi in bon],[A[bi].ids for bi in bon])
+            for bi,t in zip(bon,toks):
+                A[bi].ids.append(t)
+                self.finish_check(A[bi])
 
+        for bi,r in enumerate(A):
+            p,j=tip[r],J[bi]
             #stale kv of rejected drafts: the pass wrote positions p+1..p+M+1, valid through p+j.
             #position-addressed slots mean rollback is just rewinding fed lengths
             r.fed=p+1+j
             if M>0:
-                r.stash[0].push(hv[:j])
+                r.stash[0].push(h[bi*(M+1):bi*(M+1)+j])
             for i in range(1,M):
                 if i>=j:  #head i's tip entry used draft d_i, which was rejected
                     r.head_fed[i]=p
