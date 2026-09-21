@@ -112,6 +112,10 @@ class Scheduler:
         self.active=[]
         self.finished=[]
         self.accepted=self.drafted=0  #speculative acceptance stats
+        self.head_acc=[0]*self.M   #per head accept count, alpha_k=head_acc/head_try
+        self.head_try=[0]*self.M   #times draft k was tested (only when d1..d_k-1 accepted)
+        self.trunk_passes=0        #prefill + spec launches, tokens/trunk pass is the metric that matters
+        self.preempts=0
 
     def submit(self,req):
         #request into job queue
@@ -137,6 +141,7 @@ class Scheduler:
             self.active.append(req)
 
     def preempt(self):
+        self.preempts+=1
         req=self.active.pop()
         req.user.free_cache()
         req.user=None
@@ -268,6 +273,7 @@ class Scheduler:
         #prefill trunk
         rows=[(r,p,r.ids[p]) for r in pre for p in range(P[r])]
         h=self.prefill_launch(rows,self.model.prefill_rows)
+        self.trunk_passes+=1
 
         #head i covers positions [0, P-2-i] (embed of token t+1+i must lie inside the prompt);
         #its frontier lands at P-1-i and the next spec iteration's catch-up takes it from there.
@@ -349,6 +355,7 @@ class Scheduler:
             chain=[r.ids[-1]]+draft[r]
             rows+=[(r,tip[r]+1+k,chain[k]) for k in range(M+1)]
         h=self.launch(rows,self.model.trunk_rows)
+        self.trunk_passes+=1
 
         for bi,r in enumerate(A):
             hv=h[bi*(M+1):(bi+1)*(M+1)]
@@ -358,8 +365,10 @@ class Scheduler:
                 q=r.sample_prob(self.model.logits(hv[k]),snap[r])
                 d=draft_prob[r][k]
                 tok=draft[r][k]
+                self.head_try[k]+=1
                 if not r.done and torch.rand(1).item()<(q[tok]/(d[tok]+1e-10)).item():
                     r.ids.append(tok)  #accept
+                    self.head_acc[k]+=1
                     self.finish_check(r)
                 else:
                     j=k+1
