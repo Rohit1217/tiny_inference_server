@@ -1,11 +1,12 @@
-#perf evals for the server. python evals.py perf | load
+#perf evals for the server. python evals.py perf | load | naive
 #perf runs in process: latency, throughput vs batch, spec stats, memory, roofline
 #load goes through serve.py over http with poisson arrivals, throughput vs p99 sweep
+#naive is the ladder: no kv cache -> kv cache -> batching -> speculation, short and long prompts
 import sys,time,random,asyncio,subprocess,statistics
 import torch
 
 import server as S
-from server import Scheduler,Request
+from server import Scheduler,Request,User,batch_probs,EOS
 from main_models_new import Transformer
 from block_table import block_table
 from Tokenizers.tokenizer_fast import Tokenizer
@@ -101,7 +102,8 @@ def run(model,tok,prompts,spec,max_batch,temp=0.9,pool_bytes=S.POOL_BYTES,seed=0
 
     torch.cuda.synchronize(); t0=time.perf_counter()
     for p in prompts:
-        r=Request(tok.encode(p),MAXNEW,temperature=temp,top_k=50,top_p=0.95,rep_penalty=1.1)
+        #prompts are strings or ready token lists (long prompt case)
+        r=Request(p if isinstance(p,list) else tok.encode(p),MAXNEW,temperature=temp,top_k=50,top_p=0.95,rep_penalty=1.1)
         r.t_sub=time.perf_counter(); r.t_adm=None; r.t_tok=[]; r.seen=0; r.nsteps=0
         s.submit(r)
     fin=s.run()
@@ -194,6 +196,51 @@ def perf():
     print()
 
 
+#---- naive ladder
+def nocache(model,tok,prompts):
+    #textbook generation without a kv cache: recompute the whole sequence for every new token,
+    #one request at a time. prefill_rows is a full causal forward so it is exactly that loop,
+    #the pages it writes are just scratch
+    pool=block_table(model.num_layers+model.num_mtp_heads,model.nkv_heads,model.head_dim,
+                     S.POOL_BYTES,S.TOKENS_PER_BLOCK,S.DEVICE)
+    dev=S.DEVICE; n=0
+    torch.cuda.synchronize(); t0=time.perf_counter()
+    for p in prompts:
+        ids=list(p) if isinstance(p,list) else tok.encode(p)
+        u=User(pool)
+        for _ in range(MAXNEW):
+            T=len(ids)
+            h=model.prefill_rows(torch.tensor(ids,device=dev).long(),pool,torch.arange(T,device=dev),
+                                 torch.tensor([u.slot(i) for i in range(T)],device=dev).long(),
+                                 torch.tensor([0,T],dtype=torch.int32,device=dev),T)
+            probs=batch_probs(model.logits(h[-1:]),[0.9],[50],[0.95],[1.1],[ids])
+            t=int(torch.multinomial(probs,1)); ids.append(t); n+=1
+            if t==EOS: break
+        u.free_cache()
+    torch.cuda.synchronize(); dt=time.perf_counter()-t0
+    del pool; torch.cuda.empty_cache()
+    return n/dt
+
+def naive():
+    model,tok=load_model()
+    print("MODEL LOADED")
+    #long prompts: a paragraph repeated to 1000 tokens, so the no-cache recompute is O(T^2) for real
+    para=tok.encode(" ".join(PROSE))
+    LONG=[(para*(1000//len(para)+1))[:1000] for _ in range(64)]
+    for name,short,long in (("short (~10 tok)",PROSE*4,None),("long (1000 tok)",None,LONG)):
+        P=short or long
+        for spec in (False,True): run(model,tok,P[:16],spec,16)  #warm
+        nocache(model,tok,P[:1])
+        print(f"\nLADDER {name}                            tok/s   ms/token")
+        rows=[("no kv cache, batch 1",              lambda:nocache(model,tok,P[:4])),
+              ("kv cache, batch 1",                 lambda:run(model,tok,P[:4],False,1)["tps"]),
+              ("+ continuous batching, batch 16",  lambda:run(model,tok,P[:16],False,16)["tps"]),
+              ("+ speculative decoding, batch 16", lambda:run(model,tok,P[:16],True,16)["tps"]),
+              ("+ batch 64",                       lambda:run(model,tok,P[:64],True,64)["tps"])]
+        for label,fn in rows:
+            tps=fn()
+            print(f"  {label:36s} {tps:8.1f}   {1e3/tps:7.2f}")
+
 #---- load test over http, poisson arrivals through serve.py
 async def one(sess,prompt):
     import aiohttp
@@ -249,4 +296,4 @@ def load():
 
 
 if __name__=="__main__":
-    {"perf":perf,"load":load}[sys.argv[1] if len(sys.argv)>1 else "perf"]()
+    {"perf":perf,"load":load,"naive":naive}[sys.argv[1] if len(sys.argv)>1 else "perf"]()

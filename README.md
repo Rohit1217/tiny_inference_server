@@ -118,6 +118,34 @@ speculation actually lost to plain decode at batch 16 (307 vs 325 tok/s).
 Batching the logits, the sort and the accept test across all rows in an
 iteration removed it: batch 16 went from 307 to 674 tok/s with speculation.
 
+How much each piece buys, starting from the textbook loop that recomputes
+the whole sequence for every token (`python evals.py naive`). 100 new tokens
+per request, short prompts are ~10 tokens, long prompts are 1000 tokens:
+
+| | short tok/s | long tok/s |
+|---|---|---|
+| no KV cache, one request at a time | 39.5 | 28.3 |
+| KV cache, one request at a time | 30.0 | 32.3 |
+| + continuous batching, batch 16 | 490.5 | 420.5 |
+| + speculative decoding, batch 16 | 714.4 | 737.3 |
+| + batch 64 | 2250.2 | 1365.8 |
+
+The first two rows are the honest surprise. The KV cache does not help at
+all on short prompts and is only 14% faster at 1000 tokens. At this model
+size the recompute is cheap (a full forward over 1000 tokens is ~2 TFLOP,
+20-30 ms on this GPU) and the decode path actually has *more* kernel
+launches per layer than the prefill path (page write + flash decode +
+reduce, versus one intra-doc attention launch), so at batch 1 the cache
+saves compute that was never the bottleneck. It would start to matter at a
+few thousand tokens of context, or with a bigger model.
+
+Batching is where the real win is (about 15x), because an iteration costs
+the same ~33 ms whether it carries 1 row or 16. Speculation adds another
+1.5-1.75x on top, and going to batch 64 another 2-3x. End to end that is
+57x over the naive loop on short prompts and 48x on long ones. The long
+prompt is a repeated paragraph, which the model predicts well, so draft
+acceptance is a bit higher there.
+
 Speculative decoding stats (batch 8):
 
 | | alpha1 | alpha2 given d1 accepted | tokens / iteration |
