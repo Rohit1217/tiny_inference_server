@@ -146,6 +146,65 @@ the same ~33 ms whether it carries 1 row or 16. Speculation adds another
 prompt is a repeated paragraph, which the model predicts well, so draft
 acceptance is a bit higher there.
 
+### Paged vs static KV cache, at equal memory
+
+The point of paging is that a request does not have to reserve its worst-case
+length up front. To measure that I added a static allocator that grabs every
+page it will ever need at admission (`python evals.py mem`). Nothing else
+changes, same kernels and same scheduler, so the only difference is the memory
+policy.
+
+How many requests fit at once is just arithmetic. KV is 48 KiB per token
+across the 32 planes (30 layers + 2 MTP heads), so a 16-token page is 768 KiB:
+
+| pool | pages | request length | paged | static @ known length | static @ max_context |
+|---|---|---|---|---|---|
+| 256 MB | 341 | 110 tok | 48 | 48 | does not fit |
+| 1 GB | 1365 | 110 tok | 195 | 195 | 2 |
+| 4 GB | 5461 | 110 tok | 780 | 780 | 10 |
+| 4 GB | 5461 | 1510 tok | 57 | 57 | 10 |
+
+A server that does not know how long a request will run has to reserve
+`max_context`, and that is the 8192-token column: ten concurrent requests in
+4 GB, and nothing at all in 256 MB. That is the real argument for paging.
+
+Measured, 256 MB pool, requests arriving a few per iteration so they sit at
+different lengths, batch cap lifted to 512. Throughput is the median of 3;
+run to run spread is about 1.5x even on an idle GPU, so small differences
+here mean nothing:
+
+| workload | allocator | peak concurrent | tok/s | preemptions |
+|---|---|---|---|---|
+| 100 tok | paged, admit on current | 158 | 2236 | 1124 |
+| 100 tok | paged, admit on final | 48 | 1740 | 0 |
+| 100 tok | static @ prompt+max_new | 48 | 1744 | 0 |
+| 100 tok | static @ max_context | does not fit | | |
+| 30-800 tok | paged, admit on current | 127 | 1062 | 1421 |
+| 30-800 tok | paged, admit on final | 37 | 773 | 0 |
+| 30-800 tok | static @ prompt+max_new | 39 | 814 | 0 |
+| 1200 tok | paged, admit on current | 24 | 508 | 62 |
+| 1200 tok | paged, admit on final | 4 | 237 | 0 |
+| 1200 tok | static @ prompt+max_new | 4 | 241 | 0 |
+
+Two things fall out of this that I did not expect.
+
+Paging and static allocation are the same speed when you know the exact
+length (1740 vs 1744, 237 vs 241). The storage policy on its own buys
+nothing. What paging actually buys is permission to over-admit: since a
+request only holds the pages it has grown into, you can admit three times
+more requests than will eventually fit, and deal with the overflow by
+preempting.
+
+And over-admitting is worth it here, by a lot: 158 concurrent at 2236 tok/s
+against 48 at 1740, even though it costs 1124 preemptions. That is only true
+because this server is launch-bound. An iteration costs the same ~33 ms
+whether it carries 48 rows or 158, so the extra concurrency is nearly free,
+and a preempted request is replayed by one batched prefill launch. On a
+server that was actually bandwidth-bound the arithmetic would go the other
+way, and the conservative admission policy would win. So the admission
+policy, which I originally wrote without thinking about it, turns out to
+matter as much as the allocator.
+
 Speculative decoding stats (batch 8):
 
 | | alpha1 | alpha2 given d1 accepted | tokens / iteration |
@@ -223,7 +282,7 @@ paged_attention_kernels.py    triton flash decode over a page table (GQA)
 intradocatt_fwd_kernels.py    triton intra-doc attention, used for prefill
 server.py                     scheduler: admit / prefill / spec decode / preempt
 serve.py                      aiohttp server with streaming
-evals.py                      perf + load evals
+evals.py                      perf + load + naive + memory evals
 test_server.py                correctness tests (tiny random model)
 test_gqa_paged.py             kernel test
 ```

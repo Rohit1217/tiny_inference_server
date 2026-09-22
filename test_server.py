@@ -48,10 +48,10 @@ def pool_for(model,nblocks=None):
     page=16*2*2*KVH*(NL+MTP)*HD
     return block_table(NL+MTP,KVH,HD,(nblocks or 512)*page,16,dev)
 
-def run_sched(model,seqs,spec,maxnew,max_batch=8,nblocks=None,seed=1,**samp):
+def run_sched(model,seqs,spec,maxnew,max_batch=8,nblocks=None,seed=1,plan="final",**samp):
     torch.manual_seed(seed)
     p=pool_for(model,nblocks)
-    s=Scheduler(model,p,max_batch,MAX_CTX,dev,spec=spec)
+    s=Scheduler(model,p,max_batch,MAX_CTX,dev,spec=spec,plan=plan)
     for i,seq in enumerate(seqs):
         r=Request(list(seq),maxnew,**samp); r.tag=i
         s.submit(r)
@@ -111,7 +111,9 @@ for vocab,label in ((100,"reject-only"),(6,"mixed-accept")):
     plain,_,_=run_sched(m,sq,False,20,**g)
     spec,pool_sp,sch=run_sched(m,sq,True,20,**g)
     check(f"vocab={vocab} ({label})",plain==spec,f"acceptance {sch.accepted}/{sch.drafted}")
-    small,pool_s,ss=run_sched(m,sq,True,20,max_batch=2,nblocks=5,**g)
+    #plan="cur" admits on current need, which is what makes the pool fill and preemption fire.
+    #the default "final" admission never preempts, so this path needs it forced
+    small,pool_s,ss=run_sched(m,sq,True,20,max_batch=2,nblocks=5,plan="cur",**g)
     check(f"vocab={vocab} + preemption",plain==small,f"preempts {ss.preempts}")
     check("pools drained",len(pool_sp.free_block_queue)==pool_sp.num_blocks and len(pool_s.free_block_queue)==pool_s.num_blocks)
 

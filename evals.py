@@ -1,4 +1,4 @@
-#perf evals for the server. python evals.py perf | load | naive
+#perf evals for the server. python evals.py perf | load | naive | mem
 #perf runs in process: latency, throughput vs batch, spec stats, memory, roofline
 #load goes through serve.py over http with poisson arrivals, throughput vs p99 sweep
 #naive is the ladder: no kv cache -> kv cache -> batching -> speculation, short and long prompts
@@ -196,6 +196,70 @@ def perf():
     print()
 
 
+#---- static vs paged at equal memory
+def staggered(model,tok,reqs,static,pool_bytes,max_batch=512,every=4,plan="final"):
+    #admit a few requests per iteration instead of all at once, so at any instant requests sit at
+    #different lengths. submitted all at once they grow in lockstep and paging shows no gain
+    pool=block_table(model.num_layers+model.num_mtp_heads,model.nkv_heads,model.head_dim,
+                     pool_bytes,S.TOKENS_PER_BLOCK,S.DEVICE)
+    s=Scheduler(model,pool,max_batch,cfg.MAX_CONTEXT,S.DEVICE,spec=True,static=static,plan=plan)
+    pend=list(reqs); peak=0
+    torch.cuda.synchronize(); t0=time.perf_counter()
+    while pend or s.queue or s.active:
+        for _ in range(every):
+            if pend: s.submit(pend.pop(0))
+        s.admit()
+        peak=max(peak,len(s.active))
+        s.step()
+    torch.cuda.synchronize(); dt=time.perf_counter()-t0
+    ntok=sum(len(r.out_ids()) for r in s.finished)
+    mean_len=statistics.mean(len(r.ids) for r in s.finished)
+    res=dict(peak=peak,tps=ntok/dt,mean_len=mean_len,preempts=s.preempts,nblocks=pool.num_blocks)
+    del pool,s; torch.cuda.empty_cache()
+    return res
+
+def mem():
+    model,tok=load_model()
+    tpb=S.TOKENS_PER_BLOCK
+    kv_tok=(model.num_layers+model.num_mtp_heads)*model.nkv_heads*2*model.head_dim*2
+    print(f"MODEL LOADED. kv {kv_tok/1024:.0f} KiB/token, page = {tpb} tokens = {tpb*kv_tok/1024:.0f} KiB\n")
+
+    #---- capacity is pure arithmetic: how many requests fit at once, before any timing
+    print("CAPACITY (pages needed per request -> how many fit)")
+    print(f"{'pool':>8s} {'pages':>7s}   {'request':>14s}   {'paged (grown)':>14s} {'static @ len':>13s} {'static @ 8192':>14s}")
+    for mb in (256,1024,4096):
+        nb=mb*1024*1024//(tpb*kv_tok)
+        for L in (110,1510):
+            pg=lambda n:max(1,-(-n//tpb))
+            print(f"{mb:6d}MB {nb:7d}   {L:11d} tok   {nb//pg(L):14d} {nb//pg(L):13d} {nb//pg(8192) if nb>=pg(8192) else 0:14d}")
+    print("  paged and static@len tie at full length, the gap is that paged only holds what the")
+    print("  request has grown into so far, and frees it at EOS. measured below\n")
+
+    #---- measured, at a pool where all three allocators are actually memory bound
+    random.seed(0)
+    base=tok.encode(PROSE[0])  #~6 token prompt for every request, only the generation length varies
+    regimes=[("uniform 100 tok",[100]*160),
+             ("spread 30-800 tok",[int(min(800,max(30,random.lognormvariate(4.4,0.9)))) for _ in range(160)]),
+             ("all long 1200 tok",[1200]*24)]
+
+    POOL_MB=256
+    nb=POOL_MB*1024*1024//(tpb*kv_tok)
+    print(f"MEASURED   pool {POOL_MB} MB = {nb} pages = {nb*tpb} tokens, MAX_BATCH lifted to 512")
+    print("  tok/s is median of 3 (run to run spread is ~1.5x even on an idle gpu)")
+    print(f"{'workload':20s} {'allocator':26s} {'peak':>6s} {'tok/s':>8s} {'mean len':>9s}  preempts")
+    for name,lens in regimes:
+        for label,st,pl in (("paged, admit on current",None,"cur"),("paged, admit on final",None,"final"),
+                            ("static @ prompt+max_new","req","final"),("static @ max_context 8192","ctx","final")):
+            mk=lambda:[Request(base,l,temperature=0.9,top_k=50,top_p=0.95) for l in lens]
+            try:
+                staggered(model,tok,mk(),st,POOL_MB*1024*1024,plan=pl)  #warm
+                rs=[staggered(model,tok,mk(),st,POOL_MB*1024*1024,plan=pl) for _ in range(3)]
+                r=rs[0]; med=statistics.median(x["tps"] for x in rs)
+                print(f"  {name:18s} {label:26s} {r['peak']:6d} {med:8.0f} {r['mean_len']:9.0f}  {r['preempts']}")
+            except RuntimeError:
+                print(f"  {name:18s} {label:26s} {'--':>6s} {'--':>8s} {'--':>9s}  does not fit")
+        print()
+
 #---- naive ladder
 def nocache(model,tok,prompts):
     #textbook generation without a kv cache: recompute the whole sequence for every new token,
@@ -296,4 +360,4 @@ def load():
 
 
 if __name__=="__main__":
-    {"perf":perf,"load":load,"naive":naive}[sys.argv[1] if len(sys.argv)>1 else "perf"]()
+    {"perf":perf,"load":load,"naive":naive,"mem":mem}[sys.argv[1] if len(sys.argv)>1 else "perf"]()

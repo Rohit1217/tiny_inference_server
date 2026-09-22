@@ -103,7 +103,13 @@ class Scheduler:
     #and speculative verify all share one launch path: kv for every row is written first, then
     #each row attends kv_len=pos+1, so multi-row chunks are causal automatically.
 
-    def __init__(self,model,pool,max_batch,max_context,device,spec=True):
+    def __init__(self,model,pool,max_batch,max_context,device,spec=True,static=None,plan="final"):
+        #two independent policies. STORAGE: static=None pages on demand, static="ctx"/"req"/<int>
+        #reserves that many tokens up front (the pre-paged way). ADMISSION: plan="cur" admits while
+        #the pool fits what requests hold NOW, plan="final" while it fits what they will need by
+        #the time they finish. paging with plan="cur" over-admits and thrashes on preemption
+        self.static=static
+        self.plan=plan
         self.model=model
         self.pool=pool
         self.max_batch=max_batch
@@ -133,15 +139,37 @@ class Scheduler:
 
         tpb=self.pool.tokens_per_block
         while self.queue and len(self.active)<self.max_batch:
-            pages_needed=(len(self.queue[0].ids)+self.M+2)//tpb+1
-            if pages_needed>self.free_blocks() and self.active:
+            q=self.queue[0]
+            pages_needed=(self.reserve_tokens(q)+self.M+2)//tpb+1
+            if self.static and pages_needed>self.pool.num_blocks:
+                raise RuntimeError(f"static reservation {pages_needed} pages > pool {self.pool.num_blocks}")
+            if self.plan=="final" and not self.static:
+                #pages everyone will hold at their longest, so growth cannot outrun the pool
+                proj=sum(self.final_pages(r) for r in self.active)+self.final_pages(q)
+                if proj>self.pool.num_blocks and self.active:
+                    break
+            elif pages_needed>self.free_blocks() and (self.active or self.static):
                 break
             req=self.queue.popleft()
             req.user=User(self.pool)
+            if self.static:  #grab every page now, so this request can never need more later
+                for i in range(0,self.reserve_tokens(req)+self.M+1,tpb): req.user.slot(i)
             req.reset()
             req.head_fed=[0]*self.M
             req.stash=[HidBuf() for _ in range(self.M)]
             self.active.append(req)
+
+    def final_pages(self,r):
+        #pages this request will hold once it has generated everything it is allowed to
+        tpb=self.pool.tokens_per_block
+        return (r.prompt_len+r.max_new_tokens+self.M+2)//tpb+1
+
+    def reserve_tokens(self,r):
+        #tokens admission must plan for: current length under paging, final length under static
+        if self.static=="ctx": return self.max_context
+        if self.static=="req": return r.prompt_len+r.max_new_tokens
+        if self.static: return self.static
+        return len(r.ids)
 
     def preempt(self):
         self.preempts+=1
@@ -163,13 +191,16 @@ class Scheduler:
 
         page_table,page_starts=[],[]
         prev=None
+        tpb=self.pool.tokens_per_block
+        maxpos={}
+        for r,pos,*_ in rows: maxpos[r]=pos  #rows per request are increasing so the last one wins
 
         #Get the page_starts arr for each requests. Assume request contiguous of form r1,r1,r1,r2,r2..=[0,0,0,3,3]
         #Can get cuseq easily from here for intradoc and page atten. 
         for r,pos,*_ in rows:
             if r is not prev:
                 start=len(page_table)
-                page_table+=r.user.block_ids
+                page_table+=r.user.block_ids[:maxpos[r]//tpb+1]  #kernel reads cdiv(kv_len,tpb) pages, no more
                 prev=r
             page_starts.append(start)
 
