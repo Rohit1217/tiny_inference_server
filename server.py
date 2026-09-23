@@ -107,7 +107,7 @@ class Scheduler:
         #two independent policies. STORAGE: static=None pages on demand, static="ctx"/"req"/<int>
         #reserves that many tokens up front (the pre-paged way). ADMISSION: plan="cur" admits while
         #the pool fits what requests hold NOW, plan="final" while it fits what they will need by
-        #the time they finish. paging with plan="cur" over-admits and thrashes on preemption
+        #the time they finish. plan="cur" fits more requests and preempts as they grow
         self.static=static
         self.plan=plan
         self.model=model
@@ -125,6 +125,8 @@ class Scheduler:
         self.head_try=[0]*self.M   #times draft k was tested (only when d1..d_k-1 accepted)
         self.trunk_passes=0        #prefill + spec launches, tokens/trunk pass is the metric that matters
         self.preempts=0
+        self.replays=0             #preempted after doing work, kv thrown away and prefilled again
+        self.peak_running=0        #most requests that ran in one iteration, after preemption
 
     def submit(self,req):
         #request into job queue
@@ -138,6 +140,11 @@ class Scheduler:
         #Initallize user for request and mtp buffers
 
         tpb=self.pool.tokens_per_block
+        #paged requests only take pages at launch, so free_blocks() does not move while we admit.
+        #track a budget instead: free pages minus what active requests grow into this step, minus
+        #what each request admitted in this loop will take. without it one fitting request lets
+        #the whole queue in and step() preempts them all again before they run
+        budget=self.free_blocks()-sum(self.grow_pages(r) for r in self.active)
         while self.queue and len(self.active)<self.max_batch:
             q=self.queue[0]
             pages_needed=(self.reserve_tokens(q)+self.M+2)//tpb+1
@@ -148,8 +155,9 @@ class Scheduler:
                 proj=sum(self.final_pages(r) for r in self.active)+self.final_pages(q)
                 if proj>self.pool.num_blocks and self.active:
                     break
-            elif pages_needed>self.free_blocks() and (self.active or self.static):
+            elif pages_needed>budget and (self.active or self.static):
                 break
+            budget-=pages_needed
             req=self.queue.popleft()
             req.user=User(self.pool)
             if self.static:  #grab every page now, so this request can never need more later
@@ -158,6 +166,11 @@ class Scheduler:
             req.head_fed=[0]*self.M
             req.stash=[HidBuf() for _ in range(self.M)]
             self.active.append(req)
+
+    def grow_pages(self,r):
+        #pages r needs beyond what it holds to run its next step (writes up to len+M-1)
+        tpb=self.pool.tokens_per_block
+        return max(0,(len(r.ids)+self.M+tpb-1)//tpb-len(r.user.block_ids))
 
     def final_pages(self,r):
         #pages this request will hold once it has generated everything it is allowed to
@@ -174,6 +187,7 @@ class Scheduler:
     def preempt(self):
         self.preempts+=1
         req=self.active.pop()
+        if req.fed>0: self.replays+=1
         req.user.free_cache()
         req.user=None
         self.queue.appendleft(req)
@@ -247,7 +261,7 @@ class Scheduler:
         #cache-full: preempt newest until this iteration's high-water pages fit
         while True:
             #find how many pages needed. Done via subtracting pages to fit tokens - pages already acquired
-            need=sum(max(0,(len(r.ids)+M+tpb-1)//tpb-len(r.user.block_ids)) for r in self.active)
+            need=sum(self.grow_pages(r) for r in self.active)
             if need<=self.free_blocks():
                 break
             if len(self.active)==1:
@@ -257,6 +271,7 @@ class Scheduler:
         A=self.active
         if not A:
             return
+        self.peak_running=max(self.peak_running,len(A))
 
         #route: fresh/replayed requests (cache empty) take the intradoc prefill path — even a
         #1-token prompt, since spec_step needs the tip hidden prefill stashes; steady-state
